@@ -426,6 +426,15 @@ def run_simulation(
 # SIDEBAR — Global Settings
 # ──────────────────────────────────────────────────────────────────
 with st.sidebar:
+    st.subheader("Simulation Type")
+    sim_type = st.selectbox(
+        "Select simulation type",
+        ["OG", "Percentile"],
+        label_visibility="collapsed",
+    )
+    st.session_state["sim_type"] = sim_type
+
+    st.divider()
     st.title("⚙️ Simulation Settings")
 
     st.session_state.lead_time = st.number_input(
@@ -1254,12 +1263,29 @@ with tab_recommend:
         # ── Sidebar params for recommendation ────────────────────
         st.sidebar.divider()
         st.sidebar.subheader("Recommendation Settings")
-        target_fill_pct = st.sidebar.slider(
-            "Target Fill Rate (%)",
-            min_value=50, max_value=99, value=95, step=1,
-            help="Desired service level. Drives safety-stock calculation "
-                 "via the normal z-score. Higher = more safety stock = higher Min.",
-        )
+        _sim_type = st.session_state.get("sim_type", "OG")
+
+        if _sim_type == "OG":
+            target_fill_pct = st.sidebar.slider(
+                "Target Fill Rate (%)",
+                min_value=50, max_value=99, value=95, step=1,
+                help="Desired service level. Drives safety-stock calculation "
+                     "via the normal z-score. Higher = more safety stock = higher Min.",
+            )
+        else:  # Percentile
+            pct_min_slider = st.sidebar.slider(
+                "Min Percentile (%)",
+                min_value=1, max_value=99, value=50, step=1,
+                help="Percentile of 4-day rolling demand used for RecMin. "
+                     "50 = median demand over a 4-day window.",
+            )
+            pct_max_slider = st.sidebar.slider(
+                "Max Percentile (%)",
+                min_value=1, max_value=99, value=95, step=1,
+                help="Percentile of 4-day rolling demand used for RecMax. "
+                     "95 = covers 95% of observed 4-day demand windows.",
+            )
+            target_fill_pct = pct_max_slider  # used for display/cap logic
 
         # ── Average daily demand + std dev per Store × Part ──────
         consumed_df["ConDate"] = pd.to_datetime(consumed_df["ConDate"])
@@ -1339,21 +1365,98 @@ with tab_recommend:
         else:
             rec["CurrentFill%"] = float("nan")
 
-        # ── Recommended Min/Max via z-score safety stock ──────────
-        # Safety stock = Z × σ × √(lead_time)
-        # RecMin = ADD × lead_time + safety_stock
-        # RecMax = RecMin + ADD × avg_cycle_days
-        z_score = float(_norm.ppf(target_fill_pct / 100.0))
-        rec["SafetyStock"] = np.ceil(
-            z_score * rec["StdDev"] * np.sqrt(max(lead_time_val, 1))
-        ).clip(lower=0)
-        rec["RecMin"] = np.ceil(
-            rec["ADD"] * lead_time_val + rec["SafetyStock"]
-        ).astype(int).clip(lower=0)
-        rec["RecMax"] = np.ceil(
-            rec["RecMin"] + rec["ADD"] * rec["AvgCycleDays"]
-        ).astype(int)
-        rec["RecMax"] = rec[["RecMin", "RecMax"]].max(axis=1) + 1
+        if _sim_type == "OG":
+            # ── OG: z-score safety stock ──────────────────────────
+            # RecMin = ADD × lead_time + Z × σ × √(lead_time)
+            # RecMax = RecMin + ADD × avg_cycle_days
+            z_score = float(_norm.ppf(target_fill_pct / 100.0))
+            rec["SafetyStock"] = np.ceil(
+                z_score * rec["StdDev"] * np.sqrt(max(lead_time_val, 1))
+            ).clip(lower=0)
+            rec["RecMin"] = np.ceil(
+                rec["ADD"] * lead_time_val + rec["SafetyStock"]
+            ).astype(int).clip(lower=0)
+            rec["RecMax"] = np.ceil(
+                rec["RecMin"] + rec["ADD"] * rec["AvgCycleDays"]
+            ).astype(int)
+            rec["RecMax"] = rec[["RecMin", "RecMax"]].max(axis=1) + 1
+            rec["RecFill%"] = target_fill_pct
+
+        else:
+            # ── Percentile: forward 4-day rolling demand ──────────
+            # 1. Build full date spine from All_Dates clipped to consumed range
+            all_dates_df = st.session_state.all_dates
+            consumed_df["ConDate"] = pd.to_datetime(consumed_df["ConDate"])
+            c_min = consumed_df["ConDate"].min()
+            c_max = consumed_df["ConDate"].max()
+
+            if all_dates_df is not None:
+                date_spine = (
+                    pd.to_datetime(all_dates_df["ConDate"])
+                    .drop_duplicates()
+                    .pipe(lambda s: s[(s >= c_min) & (s <= c_max)])
+                    .sort_values()
+                    .reset_index(drop=True)
+                    .rename("ConDate")
+                    .to_frame()
+                )
+            else:
+                date_spine = (
+                    consumed_df["ConDate"].drop_duplicates()
+                    .sort_values().reset_index(drop=True)
+                    .rename("ConDate").to_frame()
+                )
+
+            # 2. All store × part combos from consumed
+            combos = consumed_df[["StoreNum", "PartNum"]].drop_duplicates()
+
+            # 3. Cross-join dates × combos → full grid
+            date_spine["_key"] = 1
+            combos["_key"]     = 1
+            grid = date_spine.merge(combos, on="_key").drop(columns="_key")
+
+            # 4. Left-join actual consumption, fill nulls with 0
+            daily = grid.merge(
+                consumed_df[["ConDate", "StoreNum", "PartNum", "Consumption"]],
+                on=["ConDate", "StoreNum", "PartNum"], how="left"
+            )
+            daily["Consumption"] = daily["Consumption"].fillna(0)
+
+            # 5. Sort and compute forward 4-day rolling demand per SKU
+            # Approach: sum remaining available days at end of dataset
+            # (shift(-N) fills 0 when fewer than N dates remain in the group)
+            daily = daily.sort_values(["StoreNum", "PartNum", "ConDate"])
+            def fwd_4(x):
+                return (
+                    x
+                    + x.shift(-1, fill_value=0)
+                    + x.shift(-2, fill_value=0)
+                    + x.shift(-3, fill_value=0)
+                )
+            daily["Rolling4DayDemand"] = (
+                daily.groupby(["StoreNum", "PartNum"])["Consumption"]
+                .transform(fwd_4)
+            )
+
+            # 6. Percentile of Rolling4DayDemand per SKU
+            pct_stats = (
+                daily.groupby(["StoreNum", "PartNum"])["Rolling4DayDemand"]
+                .agg(
+                    RecMin=lambda x: int(np.ceil(np.percentile(x, pct_min_slider))),
+                    RecMax=lambda x: int(np.ceil(np.percentile(x, pct_max_slider))),
+                    AvgRolling4=lambda x: round(x.mean(), 3),
+                )
+                .reset_index()
+            )
+            # Ensure RecMax >= RecMin
+            pct_stats["RecMax"] = pct_stats[["RecMin", "RecMax"]].max(axis=1)
+
+            rec = rec.merge(pct_stats, on=["StoreNum", "PartNum"], how="left")
+            rec["RecMin"] = rec["RecMin"].fillna(0).astype(int)
+            rec["RecMax"] = rec["RecMax"].fillna(0).astype(int)
+            rec["AvgRolling4"] = rec["AvgRolling4"].fillna(0)
+            rec["RecFill%"] = pct_max_slider
+            z_score = None  # not used in Percentile mode
 
         # ── Cap recommendations when current fill already meets target ─
         # If the SKU is already hitting the target fill rate, don't recommend
@@ -1363,9 +1466,6 @@ with tab_recommend:
             "RecMin", "CurrentMin"]].min(axis=1)
         rec.loc[already_meeting, "RecMax"] = rec.loc[already_meeting, [
             "RecMax", "CurrentMax"]].min(axis=1)
-
-        # ── Recommended fill% (re-use z → pct) ───────────────────
-        rec["RecFill%"] = target_fill_pct
 
         # Delta columns
         rec["ΔMin"] = rec["RecMin"] - rec["CurrentMin"]
@@ -1431,19 +1531,34 @@ with tab_recommend:
             rec_filtered = rec_filtered[rec_filtered["Velocity"] == rec_vel]
 
         # ── Display columns ───────────────────────────────────────
-        disp_cols = [c for c in
-            ["StoreNum", "StoreDesc", "PartNum", "Velocity", "ADD",
-             "CurrentMin", "RecMin", "ΔMin",
-             "CurrentMax", "RecMax", "ΔMax",
-             "CurrentFill%", "RecFill%",
-             "Comments"]
-            if c in rec_filtered.columns]
-
-        st.info(
-            f"Showing **{len(rec_filtered):,}** records. "
-            f"Target fill rate: **{target_fill_pct}%** (z={z_score:.2f}). "
-            f"RecMin = ADD × lead time + safety stock.  RecMax = RecMin + ADD × avg order cycle."
-        )
+        if _sim_type == "OG":
+            disp_cols = [c for c in
+                ["StoreNum", "StoreDesc", "PartNum", "Velocity", "ADD",
+                 "CurrentMin", "RecMin", "ΔMin",
+                 "CurrentMax", "RecMax", "ΔMax",
+                 "CurrentFill%", "RecFill%",
+                 "Comments"]
+                if c in rec_filtered.columns]
+            st.info(
+                f"Showing **{len(rec_filtered):,}** records. "
+                f"Target fill rate: **{target_fill_pct}%** (z={z_score:.2f}). "
+                f"RecMin = ADD × lead time + safety stock.  "
+                f"RecMax = RecMin + ADD × avg order cycle."
+            )
+        else:
+            disp_cols = [c for c in
+                ["StoreNum", "StoreDesc", "PartNum", "Velocity", "ADD", "AvgRolling4",
+                 "CurrentMin", "RecMin", "ΔMin",
+                 "CurrentMax", "RecMax", "ΔMax",
+                 "CurrentFill%", "RecFill%",
+                 "Comments"]
+                if c in rec_filtered.columns]
+            st.info(
+                f"Showing **{len(rec_filtered):,}** records. "
+                f"RecMin = {pct_min_slider}th percentile of 4-day rolling demand.  "
+                f"RecMax = {pct_max_slider}th percentile of 4-day rolling demand.  "
+                f"Incomplete windows at end of dataset are summed from remaining available days."
+            )
 
         st.dataframe(
             rec_filtered[disp_cols],
@@ -1453,8 +1568,9 @@ with tab_recommend:
                 "StoreDesc":   st.column_config.TextColumn("Store Name"),
                 "PartNum":     st.column_config.NumberColumn("Part #",           format="%d"),
                 "Velocity":    st.column_config.TextColumn("Velocity"),
-                "ADD":         st.column_config.NumberColumn("Avg Daily Demand", format="%.3f"),
-                "CurrentMin":  st.column_config.NumberColumn("Current Min",      format="%d"),
+                "ADD":         st.column_config.NumberColumn("Avg Daily Demand",    format="%.3f"),
+                "AvgRolling4": st.column_config.NumberColumn("Avg 4-Day Demand",  format="%.3f"),
+                "CurrentMin":  st.column_config.NumberColumn("Current Min",        format="%d"),
                 "RecMin":      st.column_config.NumberColumn("Rec. Min",         format="%d"),
                 "ΔMin":        st.column_config.NumberColumn("Δ Min",            format="%+d"),
                 "CurrentMax":  st.column_config.NumberColumn("Current Max",      format="%d"),
